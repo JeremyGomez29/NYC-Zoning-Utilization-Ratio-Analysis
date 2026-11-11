@@ -1,0 +1,314 @@
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(reshape2)
+library(car)
+
+#Set working directory here
+setwd('')
+
+# Load Data
+bis_data <- read.csv("DOB_Certificate_of_Occupancy_2012_2021.csv", stringsAsFactors = FALSE)
+dob_now_data <- read.csv("DOB_NOW_Certificate_of_Occupancy.csv", stringsAsFactors = FALSE)
+DOB_JOB_APP <- read.csv("DOB_Job_Application_Filings.csv", stringsAsFactors = FALSE)
+PLUTO <- read.csv("PLUTO.csv", stringsAsFactors = FALSE)
+
+# Data Cleaning
+# Clean BIS Certificate of Occupancy Data set
+bis_clean <- bis_data %>%
+  select(
+    Job_Number = JOB_NUMBER,
+    Job_Type = JOB_TYPE,
+    Borough = BOROUGH,
+    Block = BLOCK,
+    Lot = LOT,
+    Issue_Date = C_O_ISSUE_DATE,
+    Dwelling_Units = PR_DWELLING_UNIT,
+    Issue_Type = ISSUE_TYPE,
+    Bin = BIN
+  ) %>%
+  mutate(
+    Source = "BIS",
+    Job_Number = as.character(Job_Number),
+    Block = as.character(Block),
+    Lot = as.character(Lot),
+    
+    Job_Type = case_when(
+      Job_Type == "NB" ~ "New Building",
+      Job_Type == "A1" ~ "Alteration 1", 
+      TRUE ~ Job_Type
+    ),
+    Issue_Date = mdy(Issue_Date), 
+    Dwelling_Units = as.numeric(Dwelling_Units)
+  )
+
+# Clean DOB NOW Certificate of Occupancy Dataset
+dob_now_clean <- dob_now_data %>%
+  select(
+    Job_Number = `JOB.FILING.NAME`, 
+    Job_Type = `JOB.TYPE`,
+    Borough = `BOROUGH`,
+    Block = `BLOCK`,
+    Lot = `LOT`,
+    Issue_Date = `C.OF.O.ISSUANCE.DATE`,
+    Issue_Type = `C.OF.O.FILING.TYPE`, 
+    Bin = `BIN`
+  ) %>%
+  mutate(
+    Source = "DOB NOW",
+    Job_Number = as.character(Job_Number),
+    Block = as.character(Block),
+    Lot = as.character(Lot),
+    
+    Job_Type = case_when(
+      Job_Type == "NB" ~ "New Building",
+      TRUE ~ Job_Type
+    ),
+    Issue_Date = mdy(Issue_Date),
+    Dwelling_Units = NA_real_ 
+  )
+
+# Combine Certificate of Occupancy Datasets
+combined_co_data <- bind_rows(bis_clean, dob_now_clean)
+#str(combined_co_data)
+
+# Create Borough Block and Lot identifier for join with other datasets
+combined_co_data <- combined_co_data %>%
+  mutate(
+    Borough_Code = case_when(
+      toupper(Borough) == "MANHATTAN" ~ "1",
+      toupper(Borough) == "BRONX" ~ "2",
+      toupper(Borough) == "BROOKLYN" ~ "3",
+      toupper(Borough) == "QUEENS" ~ "4",
+      toupper(Borough) == "STATEN ISLAND" ~ "5",
+      TRUE ~ NA_character_
+    ),
+    BBL = paste0(
+      Borough_Code,
+      sprintf("%05d", as.numeric(Block)),
+      sprintf("%04d", as.numeric(Lot))
+    )
+  )
+
+# Clean the DOB JOB number dataset
+dob_job_clean <- DOB_JOB_APP %>%
+  select(
+    Job_Number = `Job..`,        
+    Units_From_App = `Proposed.Dwelling.Units` 
+  ) %>%
+  mutate(
+    Job_Number = as.character(Job_Number),
+    Units_From_App = as.numeric(Units_From_App)
+  )
+
+# Join the DOB JOB number dataset to the combined Certificate of Occupancy dataset.
+combined_co_data <- combined_co_data %>%
+  left_join(dob_job_clean, by = "Job_Number") %>%
+  mutate(
+    Dwelling_Units = coalesce(Dwelling_Units, Units_From_App)
+  ) %>%
+  select(-Units_From_App)
+
+#Clean the PLUTO dataset
+pluto_clean <- PLUTO %>%
+  select(
+    BBL,
+    BuiltFAR = builtfar,
+    AllowableFAR = residfar,
+    CommFAR = commfar,
+    LotSize = lotarea,
+    LotFront = lotfront,
+    AssessLand = assessland,
+    BldgClass = bldgclass,
+    IrregularLot = irrlotcode, 
+    Landmark = landmark,
+    ZoningDistrict = zonedist1,
+    CommunityBoard = community.board,
+    Borough = borough
+  ) %>%
+  mutate(
+    BBL = as.character(BBL),
+    LotSize = as.numeric(gsub(",", "", LotSize)),
+    LotFront = as.numeric(gsub(",", "", LotFront)),
+    BuiltFAR = as.numeric(gsub(",", "", BuiltFAR)),
+    Is_Landmark = as.factor(ifelse(Landmark == "", "No", "Yes")),
+    Is_Irregular = as.factor(IrregularLot),
+    Zoning_Category = as.factor(substr(ZoningDistrict, 1, 1)) 
+  )
+
+# Perform the final join
+final_dataset <- combined_co_data %>%
+  left_join(pluto_clean, by = "BBL")
+
+final_dataset <- final_dataset %>%
+  mutate(
+    Borough = stringr::str_to_title(Borough.x),
+    BuiltFAR = as.numeric(BuiltFAR),
+    AllowableFAR = as.numeric(AllowableFAR)
+  ) %>%
+  
+  filter(
+    Dwelling_Units >= 1,                            
+    AllowableFAR > 0,                                
+    !is.na(BuiltFAR), !is.na(LotSize),              
+    LotSize > 100, AssessLand > 0,                   
+    !(Job_Type == "New Building" & BuiltFAR < 0.05)
+  ) %>%
+  
+  mutate(
+    FAR_Utilization = BuiltFAR / AllowableFAR,
+    Land_Value_Per_SqFt = AssessLand / LotSize,
+    Maxed_Out = if_else(FAR_Utilization > 0.9, 1, 0),
+    
+    Job_Type = case_when(
+      grepl("New Building", Job_Type, ignore.case = TRUE) ~ "New Building",
+      grepl("Alteration", Job_Type, ignore.case = TRUE) ~ "Alteration",
+      TRUE ~ Job_Type 
+    )
+  ) %>%
+  
+  select(
+    Job_Number, Issue_Date,
+    FAR_Utilization, Maxed_Out, BuiltFAR, AllowableFAR,
+    Borough, Zoning_Category, Is_Landmark, Is_Irregular,
+    LotFront, Land_Value_Per_SqFt,
+    Job_Type, Dwelling_Units, LotSize
+  )
+
+table(final_dataset$Job_Type)
+
+## EDA
+#Correlation Chart
+cor_data <- final_dataset %>%
+  select(
+    FAR_Utilization,
+    Land_Value = Land_Value_Per_SqFt, # Renaming for cleaner chart labels
+    Lot_Frontage = LotFront,
+    Lot_Size = LotSize,
+    Dwelling_Units
+  )
+cor_matrix <- cor(cor_data, use = "complete.obs", method = "pearson")
+cor_matrix
+
+##Chi Squared Tests
+# Borough vs. Maxed Out
+chisq.test(table(final_dataset$Borough, final_dataset$Maxed_Out))
+
+#Zoning Category vs. Maxed Out
+final_dataset$Zoning_Category <- droplevels(final_dataset$Zoning_Category)
+chisq.test(table(final_dataset$Zoning_Category, final_dataset$Maxed_Out))
+
+#Landmark Status vs. Maxed Out
+chisq.test(table(final_dataset$Is_Landmark, final_dataset$Maxed_Out))
+
+# Irregular Lot vs. Maxed Out
+final_dataset$Is_Irregular <- droplevels(final_dataset$Is_Irregular)
+chisq.test(table(final_dataset$Is_Irregular, final_dataset$Maxed_Out))
+
+#Proportion Bar Charts
+plot_proportion <- function(data, x_var, title_text) {
+  ggplot(data, aes(x = .data[[x_var]], fill = as.factor(Maxed_Out))) +
+    geom_bar(position = "fill") +  # This creates the 0% to 100% proportion look
+    scale_y_continuous(labels = scales::percent) +
+    scale_fill_manual(values = c("0" = "Blue", "1" = "Red"), 
+                      name = "Maxed Out", labels = c("No", "Yes")) +
+    labs(title = title_text, x = NULL, y = "Proportion") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+library(gridExtra)
+# 1. Create the individual plots
+p1 <- plot_proportion(final_dataset, "Borough", "Maxed Out by Borough")
+p2 <- plot_proportion(final_dataset, "Zoning_Category", "Maxed Out by Zoning")
+p3 <- plot_proportion(final_dataset, "Is_Landmark", "Maxed Out by Landmark Status")
+p4 <- plot_proportion(final_dataset, "Is_Irregular", "Maxed Out by Irregular Lot")
+
+p1 <- plot_proportion(final_dataset, "Borough", "Maxed Out by Borough")
+p2 <- plot_proportion(final_dataset, "Zoning_Category", "Maxed Out by Zoning")
+p3 <- plot_proportion(final_dataset, "Is_Landmark", "Maxed Out by Landmark Status")
+p4 <- plot_proportion(final_dataset, "Is_Irregular", "Maxed Out by Irregular Lot")
+p5 <- plot_proportion(final_dataset, "Job_Type", "Maxed Out by Job Type")
+grid.arrange(p1, p2, p3, p4, p5, ncol = 3)
+
+#Logistic Regression
+logit_model <- glm(Maxed_Out ~ 
+                     Borough + 
+                     Zoning_Category + 
+                     Is_Landmark + 
+                     Is_Irregular + 
+                     Job_Type +             
+                     LotSize +              
+                     Land_Value_Per_SqFt, 
+                   data = final_dataset,
+                   family = "binomial")
+
+summary(logit_model)
+exp(coef(logit_model))
+vif(logit_model)
+
+#Create a Bootstrapped 95% CI for the logistic regression coefficients (Only run in high ram environment)
+glm_coef_fn <- function(data, indices) {
+  d <- data[indices, ]
+  fit <- glm(Maxed_Out ~ 
+               Borough + 
+               Zoning_Category + 
+               Is_Landmark + 
+               Is_Irregular + 
+               Job_Type + 
+               LotSize + 
+               Land_Value_Per_SqFt, 
+             data = d, 
+             family = "binomial")
+  
+  return(coef(fit))
+}
+set.seed(2025)
+boot_results <- boot(data = final_dataset,
+                     statistic = glm_coef_fn, 
+                     R = 1000)
+print(boot_results)
+
+#GAM Model
+##Only run in high RAM Colab environment
+time_series_data <- final_dataset %>%
+  select(Issue_Date, FAR_Utilization, Borough) %>%
+  filter(
+    !is.na(Issue_Date),
+    Issue_Date >= as.Date("2012-01-01"),
+    Issue_Date <= as.Date("2025-11-01"),
+    FAR_Utilization <= 3
+  )
+
+# Define Events
+events <- data.frame(
+  Date = as.Date(c("2016-03-22", "2020-03-20", "2022-06-15")),
+  Event = c("ZQA Amendments", "COVID-19 Shutdown", "421-a Expiration"),
+  Y_Pos = c(1.4, 1.4, 1.4)
+)
+
+# Create Plot using GAM
+ggplot(time_series_data, aes(x = Issue_Date, y = FAR_Utilization)) +
+  # Plot all points
+  geom_point(alpha = 0.1, color = "gray", size = 0.5) +
+  
+  # GAM Model used instead of LOESS beacuse of compute restraints.
+  geom_smooth(method = "gam", formula = y ~ s(x, bs = "cs"), 
+              color = "red", linewidth = 1.2, fill = "red", alpha = 0.2) +
+  
+  # Reference Lines
+  geom_hline(yintercept = 1.0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  annotate("text", x = as.Date("2012-07-01"), y = 1.05, label = "Max Allowed FAR (1.0)", hjust = 0, fontface = "italic") +
+  
+  # Event Lines
+  geom_vline(data = events, aes(xintercept = Date), linetype = "dotted", color = "blue", linewidth = 0.8) +
+  geom_text(data = events, aes(x = Date, y = Y_Pos, label = Event), 
+            color = "blue", angle = 90, vjust = -0.5, size = 3.5) +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  coord_cartesian(ylim = c(0, 1.6)) + 
+  theme_minimal() +
+  labs(
+    title = "Trends in Zoning Utilization: NYC Residential Buildings (2012-2025)",
+    x = "Certificate of Occupancy Issue Date",
+    y = "Zoning Utilization Ratio"
+  )
